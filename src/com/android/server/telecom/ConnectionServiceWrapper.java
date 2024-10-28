@@ -46,6 +46,7 @@ import android.telecom.DisconnectCause;
 import android.telecom.GatewayInfo;
 import android.telecom.Log;
 import android.telecom.Logging.Session;
+import android.telecom.Logging.Runnable;
 import android.telecom.ParcelableConference;
 import android.telecom.ParcelableConnection;
 import android.telecom.PhoneAccountHandle;
@@ -77,6 +78,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.Objects;
 
 /**
@@ -93,6 +96,11 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
     private CompletableFuture<Pair<Integer, Location>> mQueryLocationFuture = null;
     private @Nullable CancellationSignal mOngoingQueryLocationRequest = null;
     private final ExecutorService mQueryLocationExecutor = Executors.newSingleThreadExecutor();
+    private ScheduledExecutorService mScheduledExecutor =
+            Executors.newSingleThreadScheduledExecutor();
+    // Pre-allocate space for 2 calls; realistically thats all we should ever need (tm)
+    private final Map<Call, ScheduledFuture<?>> mScheduledFutureMap = new ConcurrentHashMap<>(2);
+    private AnomalyReporterAdapter mAnomalyReporter = new AnomalyReporterAdapterImpl();
 
     private final class Adapter extends IConnectionServiceAdapter.Stub {
 
@@ -144,6 +152,12 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
             try {
                 synchronized (mLock) {
                     logIncoming("handleCreateConferenceComplete %s", callId);
+                    Call call = mCallIdMapper.getCall(callId);
+                    if (call != null && mScheduledFutureMap.containsKey(call)) {
+                        ScheduledFuture<?> existingTimeout = mScheduledFutureMap.get(call);
+                        existingTimeout.cancel(false /* cancelIfRunning */);
+                        mScheduledFutureMap.remove(call);
+                    }
                     // Check status hints image for cross user access
                     if (conference.getStatusHints() != null) {
                         Icon icon = conference.getStatusHints().getIcon();
@@ -2378,6 +2392,13 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
     @Override
     protected void removeServiceInterface() {
         Log.v(this, "Removing Connection Service Adapter.");
+        if (mServiceInterface == null) {
+            // In some cases, we may receive multiple calls to
+            // remoteServiceInterface, such as when the remote process crashes
+            // (onBinderDied & onServiceDisconnected)
+            Log.w(this, "removeServiceInterface: mServiceInterface is null");
+            return;
+        }
         removeConnectionServiceAdapter(mAdapter);
         // We have lost our service connection. Notify the world that this service is done.
         // We must notify the adapter before CallsManager. The adapter will force any pending
@@ -2386,6 +2407,10 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
         handleConnectionServiceDeath();
         mCallsManager.handleConnectionServiceDeath(this);
         mServiceInterface = null;
+        if (mScheduledExecutor != null) {
+            mScheduledExecutor.shutdown();
+            mScheduledExecutor = null;
+        }
     }
 
     @Override
@@ -2504,6 +2529,7 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
             }
         }
         mCallIdMapper.clear();
+        mScheduledFutureMap.clear();
 
         if (mConnSvrFocusListener != null) {
             mConnSvrFocusListener.onConnectionServiceDeath(this);
